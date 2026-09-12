@@ -1,16 +1,21 @@
 /**
- * Resume plugin — provides a `/resume` slash command.
+ * Resume plugin — provides `/resume` and its alias `/continue`.
  *
  * - `/resume` → reloads the last session and sends "Continue"
  * - `/resume <custom message>` → reloads the last session and sends the custom message
+ * - `/continue` behaves exactly like `/resume` (same with custom message)
  *
  * Implementation:
- * - `config` hook registers the `resume` command template.
+ * - `config` hook registers the `resume` command template plus the `continue` alias.
  * - `resume` tool performs the actual reload (list sessions → pick last →
  *   promptAsync → best-effort TUI switch + toast).
- * - `command.execute.before` hook intercepts `/resume` invocations so the
+ * - `command.execute.before` hook intercepts both invocations so the
  *   reload happens even before the LLM runs, then rewrites the command parts
  *   to a short acknowledgement (avoiding a double tool call).
+ *
+ * Install in exactly ONE place (project `.opencode/plugin/` OR global
+ * `~/.config/opencode/plugins/`). The same plugin file installed in both
+ * places makes the hook fire twice and delivers the message twice.
  */
 
 import type { Plugin } from "@opencode-ai/plugin"
@@ -19,6 +24,7 @@ import { tool } from "@opencode-ai/plugin"
 export const DEFAULT_RESUME_MESSAGE = "Continue"
 
 export const RESUME_COMMAND = "resume"
+export const CONTINUE_COMMAND = "continue"
 export const RESUME_TOOL = "resume"
 
 type SessionLike = {
@@ -129,20 +135,38 @@ export async function resumeLastSession(
   return { session, message }
 }
 
+/**
+ * Replace the command's parts IN PLACE.
+ *
+ * The server calls this hook as `trigger(name, input, { parts })`, keeps
+ * using its own `parts` array reference, and discards the return value — so
+ * reassigning `output.parts = [...]` is silently ignored. The LLM would then
+ * see the original template ("use the resume tool...") and send a SECOND
+ * message via the tool on top of the one already sent below.
+ */
+function setCommandParts(output: { parts: unknown[] }, text: string): void {
+  output.parts.splice(0, output.parts.length, { type: "text", text } as never)
+}
+
 export const ResumePlugin: Plugin = async ({ client, directory }) => {
   return {
     config: async (cfg) => {
       cfg.command ??= {}
+      const template = [
+        `Use the ${RESUME_TOOL} tool to reload the most recent session (excluding the current session) and send it a message to continue.`,
+        ``,
+        `Message to send: $ARGUMENTS`,
+        ``,
+        `If the message above is empty, send "${DEFAULT_RESUME_MESSAGE}" instead.`,
+        `After the tool succeeds, briefly confirm which session was resumed and with what message.`,
+      ].join("\n")
       cfg.command[RESUME_COMMAND] = {
         description: "Reload the last session and continue (default: Continue)",
-        template: [
-          `Use the ${RESUME_TOOL} tool to reload the most recent session (excluding the current session) and send it a message to continue.`,
-          ``,
-          `Message to send: $ARGUMENTS`,
-          ``,
-          `If the message above is empty, send "${DEFAULT_RESUME_MESSAGE}" instead.`,
-          `After the tool succeeds, briefly confirm which session was resumed and with what message.`,
-        ].join("\n"),
+        template,
+      }
+      cfg.command[CONTINUE_COMMAND] = {
+        description: "Alias of /resume: reload the last session and continue",
+        template,
       }
     },
 
@@ -175,7 +199,7 @@ export const ResumePlugin: Plugin = async ({ client, directory }) => {
     },
 
     "command.execute.before": async (input, output) => {
-      if (input.command !== RESUME_COMMAND) return
+      if (input.command !== RESUME_COMMAND && input.command !== CONTINUE_COMMAND) return
       const requested = resolveResumeMessage(input.arguments)
       try {
         const result = await resumeLastSession(client, {
@@ -184,20 +208,16 @@ export const ResumePlugin: Plugin = async ({ client, directory }) => {
           message: requested,
         })
         const title = (result.session.title as string) || result.session.id
-        output.parts = [
-          {
-            type: "text",
-            text: `The resume has already been performed: reloaded session "${title}" (${result.session.id}) and sent it ${JSON.stringify(result.message)}. Briefly confirm this to the user. Do not call any tools.`,
-          } as any,
-        ]
+        setCommandParts(
+          output,
+          `The resume has already been performed: reloaded session "${title}" (${result.session.id}) and sent it ${JSON.stringify(result.message)}. Briefly confirm this to the user. Do not call any tools.`,
+        )
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error)
-        output.parts = [
-          {
-            type: "text",
-            text: `Failed to resume the last session: ${detail}. Report this failure to the user. Do not call any tools.`,
-          } as any,
-        ]
+        setCommandParts(
+          output,
+          `Failed to resume the last session: ${detail}. Report this failure to the user. Do not call any tools.`,
+        )
       }
     },
   }
